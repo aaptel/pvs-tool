@@ -1,0 +1,803 @@
+#!/usr/bin/perl
+#
+# Compiler spying tool for PVS-Studio
+#
+# BSD License
+#
+# Copyright (c) 2016, Aurélien Aptel <aurelien.aptel@gmail.com>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# 1. Redistributions of source code must retain the above copyright
+# notice, this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright
+# notice, this list of conditions and the following disclaimer in the
+# documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+# COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+# ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+use strict;
+use warnings;
+use Getopt::Long qw(GetOptions);
+use Data::Dumper;
+use File::Temp;
+use Cwd qw(abs_path getcwd);
+
+my $VERBOSE = 0;
+
+my $DEBUG = 0;
+
+# compiler program name to filter
+my $COMPILER = qr/(?:cc|gcc|clang|c\+\+|g\+\+|clang\+\+)$/io;
+
+# default strace output filename
+my $DEFAULT_TRACE_FILE = "strace_out";
+
+sub usage {
+    my $exit_code = shift() || 0;
+
+    print
+"Spy your build tool for compiler calls using strace.
+
+Usage: $0 COMMAND [opts]
+
+Quick usage:
+    \$ export PVS_LICENSE=~/prog/pvs/PVS-Studio.lic
+    \$ export PVS_BIN=~/prog/pvs/PVS-Studio
+    \$ pvs-tool genconf  -l C pvs.cfg
+    \$ pvs-tool trace    -- make -j8
+    \$ pvs-tool analyze  pvs.cfg
+    \$ pvs-tool view     pvs.log
+
+$0 genconf [-ebpliohv] CONF
+
+  Generate a PVS config to file CONF.
+
+    -e PATH, --exclude PATH
+            exclude files in PATH to be analyzed
+    -b PATH, --bin PATH
+            XXX: vcinstalldir
+    --platform PLAT
+            platform
+    -p PREPROC, --preprocessor
+            preprocessor
+    -l LANG, --lang LANG
+            language to analyze
+    -i LIC, --license LIC
+            path to license file (alternatively, PVS_LICENSE env var)
+    -o FILE, --output FILE
+            write analysis output to FILE
+
+$0 trace [-thv] -- ./your-build-tool -your-flags...
+
+  Trace your build tool to gather all compiler flags.
+
+    -t FILE, --trace FILE
+            store trace output to FILE (default: '$DEFAULT_TRACE_FILE')
+
+$0 analyze [-bthv] CONF
+
+  Run PVS using CONF
+
+    -t FILE, --trace FILE
+            use trace output FILE (default: '$DEFAULT_TRACE_FILE')
+    -b BIN, --bin BIN
+            use PVS executable file BIN (alternatively, PVS_BIN env var)
+
+$0 view [-pdhv] OUTPUT
+
+  Filter and print results in OUTPUT to human-readable output
+
+    -l LEVEL, --min-level LEVEL
+            print all warnings which have a level <= LEVEL (1 being
+            the most serious)
+    -d DIAG1,DIAG2,..., --disable DIAG1,DIAG2,...
+            don't print warnings of type DIAG1 or DIAG2 (ex: -d V220,V512)
+
+";
+    exit $exit_code;
+}
+
+sub main {
+    my $help;
+
+    my $cmd = shift @ARGV;
+
+    if (!defined $cmd) {
+        usage();
+    }
+    elsif ($cmd eq 'genconf') {
+        my @opt_excl = ('/usr/include/',' /usr/lib64/');
+        my @opt_bin  = ('/usr/bin/');
+        my $opt_plat = 'linux64';
+        my $opt_prep = 'gcc';
+        my $opt_lang = 'C';
+        my $opt_lic  = $ENV{'PVS_LICENSE'} || 'PVS-Studio.lic';
+        my $opt_log  = 'pvs.log';
+
+        if (!GetOptions('exclude|e=s'      => \@opt_excl,
+                        'bin|b=s'          => \@opt_bin,
+                        'platform=s'       => \$opt_plat,
+                        'preprocessor|p=s' => \$opt_prep,
+                        'lang|l=s'         => \$opt_lang,
+                        'license|i=s'      => \$opt_lic,
+                        'ouput|o=s'        => \$opt_log,
+                        'help|h'           => \$help,
+                        'verbose'          => \$VERBOSE) or $help) {
+            usage();
+        }
+
+        if (@ARGV != 1) {
+            err("specify exactly 1 config file\n");
+        }
+
+        my $cfg_file = shift @ARGV;
+
+        open my $f, '>', $cfg_file or err("can't write to file $cfg_file: $!\n");
+        for (@opt_excl) {
+            print $f "exclude-path = $_\n";
+        }
+        for (@opt_bin) {
+            print $f "vcinstalldir = $_\n";
+        }
+        print $f "platform = $opt_plat\n";
+        print $f "preprocessor = $opt_prep\n";
+        print $f "language = $opt_lang\n";
+        print $f "lic-file = $opt_lic\n";
+        print $f "output-file = $opt_log\n";
+
+        msg("generated config $cfg_file\n");
+        exit 0;
+    }
+    elsif ($cmd eq 'trace') {
+        my $opt_trace = $DEFAULT_TRACE_FILE;
+
+        if (!GetOptions('help|h'    => \$help,
+                        'trace|t=s' => \$opt_trace,
+                        'verbose'   => \$VERBOSE) or $help) {
+            usage();
+        }
+
+        if (!@ARGV) {
+            err("no build commands given\n");
+        }
+
+        make_trace($opt_trace, @ARGV);
+        msg("sucessfully traced build to $opt_trace\n");
+        exit 0;
+    }
+    elsif ($cmd eq 'analyze') {
+        my $opt_trace = $DEFAULT_TRACE_FILE;
+        my $opt_pvs_bin = $ENV{'PVS_BIN'} || 'PVS-Studio';
+        my $opt_dry = 0;
+
+
+        if (!GetOptions('bin|b=s'   => \$opt_pvs_bin,
+                        'trace|t=s' => \$opt_trace,
+                        'dry-run|n' => \$opt_dry,
+                        'help|h'    => \$help,
+                        'debug|d'   => \$DEBUG,
+                        'verbose'   => \$VERBOSE,
+            ) or $help) {
+            usage();
+        }
+
+        my $files = process_trace($opt_trace);
+        if ($opt_dry) {
+            exit 0;
+        }
+
+        if (@ARGV != 1) {
+            err("specify exactly 1 config file\n");
+        }
+
+        my $cfg_file = shift @ARGV;
+        my $cfg = read_conf($cfg_file);
+        my $out_file = $$cfg{'output-file'};
+
+        if (-e $out_file) {
+            msg("deleting existing log $out_file...\n");
+            unlink $out_file or err("can't delete $out_file\n");
+        }
+
+        my $total = scalar keys %$files;
+        my $i = 0;
+
+        if ($total == 0) {
+            msg("no compilation units found\n");
+            exit 0;
+        }
+
+        for my $path (sort keys %$files) {
+            printf "%03d/%03d [%2d%%] analyzing %s...\n", $i+1, $total, (int($i/($total+0.)*100)), $path;
+            my ($dir, $src) = splitpath($path);
+            my $params = $$files{$path};
+
+            my @cmd = ($opt_pvs_bin, '--cfg', $cfg_file, '--source-file', $path, '--cl-params', @$params, $path);
+            if ($VERBOSE) {
+                for (@cmd) {
+                    print "ARG: <$_>\n";
+                }
+            }
+            system @cmd;
+            if ($? == -1) {
+                err("can't run $opt_pvs_bin: $!\n");
+            }
+            elsif ($? != 0) {
+                msg(sprintf "pvs exited with code %d while analyzing %s, skipping.\n", ($? >> 8), $path);
+            }
+            $i++;
+        }
+        msg("analysis finished\n");
+
+        my $old_size = -s $out_file;
+        msg("cleaning output...\n");
+        system sprintf 'LC_ALL=C sort -u -o %s %s', quotemeta($out_file), quotemeta($out_file);
+        if ($? != 0) {
+            err("failed cleaning output file $out_file\n");
+        }
+        my $new_size = -s $out_file;
+        msg(sprintf "done (%dM -> %dM)\n", $old_size/1024/1024, $new_size/1024/1024);
+    }
+    elsif ($cmd eq 'view') {
+        my $opt_level = 1;
+        my $opt_dis = '';
+
+        if (!GetOptions('disable|d=s' => \$opt_dis,
+                        'level|l=s'   => \$opt_level,
+                        'help|h'      => \$help,
+                        'verbose'     => \$VERBOSE) or $help) {
+            usage();
+        }
+
+        $opt_level = int($opt_level);
+
+        my %disabled;
+        for (split /,/, $opt_dis) {
+            $disabled{$_} = 1;
+        }
+        view_log($opt_level, \%disabled);
+    }
+    else {
+        msg("unknown command $cmd\n");
+        usage(1);
+    }
+}
+
+sub make_trace {
+    my ($trace, @progs) = @_;
+
+    system 'strace', '-y', '-v', '-s', '2048', '-f', '-o', $trace, '-e', 'fork,vfork,clone,fchdir,chdir,execve', @progs;
+    if ($? == -1) {
+        err("failed to execute strace (install strace?): $?\n");
+    }
+    elsif ($? != 0) {
+        err("error while tracing program, child exited with code ".($? >> 8)."\n");
+    }
+}
+
+# quoted string regex
+my $quoted_string_rx = qr/(?:(?:[^"\\]|\\.)*)/o;
+
+#
+# we have to keep track of the process hierarchy (child/parent
+# relation) in order to know each process working directory (pwd)
+#
+# on big and long running build process there are so many processes
+# being created that the PID wrap around and you end up with PIDs
+# mapping to different processes during the lifetime of the build so
+# we keep track of <PID, trace line number> being created and exited
+# so that we know at any line in the trace which process a PID is
+# referring to.
+#
+# on highly parralelized build you can also have child process being
+# executed (and exited!) before the parent fork()/clone() call is over
+# (ie. before we have the child PID) so we have no way to know which
+# process is the parent of certain child until the fork()/clone() is
+# over. ex:
+#
+# pid1 clone(<... unfinished>       <-- father forking
+# pid2 execve(...)                  <-- child process
+# pid2 --- exited with code 0 ---   <-- child process exiting
+# pid1 <... close resumed>) = pid2
+#
+# only in the last step we know pid2 was pid1 child (and inherited its
+# pwd at that moment)
+#
+# this is why we process the trace in 2 passes:
+#
+# - in the first pass keeps track of child/parent
+# - in the second pass we inherit/mutate the pwd of each process as it
+#   changes
+#
+
+# register $pid at line $ln
+# if it doesnt exist or if the last process with this pid exited
+sub proc_tree_start {
+    my ($p, $pid, $ln) = @_;
+    if (!exists $p->{$pid} or exists $p->{$pid}[-1]{'end'}) {
+        push @{$p->{$pid}}, {'start' => $ln};
+    }
+}
+
+# register end of last process with $pid
+sub proc_tree_end {
+    my ($p, $pid, $ln) = @_;
+    if (!exists $p->{$pid} or !defined $p->{$pid}) {
+        die "$pid @ $ln was never started";
+    }
+    $p->{$pid}[-1]{'end'} = $ln;
+}
+
+# set <$pid,$ln> as a child of $parent
+sub proc_tree_set_parent {
+    my ($p, $pid, $parent, $ln) = @_;
+    if (!exists $p->{$pid}) {
+        push @{$p->{$pid}}, {'start' => $ln};
+    }
+    elsif (exists $p->{$pid}[-1]{'end'} && exists $p->{$pid}[-1]{'parent'}) {
+        push @{$p->{$pid}}, {'start' => $ln};
+    }
+
+    $p->{$pid}[-1]{'parent'} = proc_tree_get_proc($p, $parent, $ln);
+    push @{$p->{$pid}[-1]{'parent'}{'children'}}, $p->{$pid}[-1];
+}
+
+# get the parent process of <$pid,$ln>
+sub proc_tree_get_parent {
+    my ($p, $pid, $ln) = @_;
+    my $proc = proc_tree_get_proc($p, $pid, $ln);
+    if (!exists $proc->{'parent'} || !defined $proc->{'parent'}) {
+        err("no parent process found");
+    }
+    return $proc->{'parent'};
+}
+
+# return process alive at <$pid,$ln>
+sub proc_tree_get_proc {
+    my ($p, $pid, $ln) = @_;
+    my $proc;
+
+    for (@{$p->{$pid}}) {
+        # you need more than 1000 calls to any syscalls (=lines in the
+        # trace files) to get the same PID, you need about 35k at
+        # least. this is not very elegant...
+        if ($_->{'start'} <= $ln && (!defined $_->{'end'} || $ln <= $_->{'end'}+1000)) {
+            $proc = $_;
+            last;
+        }
+    }
+    if (!defined $proc) {
+        warning("no process found; $pid at $ln\n");
+        for (@{$p->{$pid}}) {
+            printf STDERR "---\nstart %d\nend   %d\n", $_->{'start'}, $_->{'end'};
+        }
+        exit 1;
+    }
+
+    return $proc;
+}
+
+# set $pid,$ln pwd to its parent pwd
+sub proc_tree_propagate_parent_pwd {
+    my ($p, $parent, $ln) = @_;
+    my $proc = proc_tree_get_proc($p, $parent, $ln);
+    if (!defined $proc->{'pwd'}) {
+        warning("no pwd3");
+    }
+    for my $child (@{$proc->{'children'}}) {
+        if (!$child->{'pwd'}) {
+            $child->{'pwd'} = $proc->{'pwd'};
+        }
+    }
+}
+
+# set $pid,$ln pwd to its parent pwd
+sub proc_tree_inherit_pwd {
+    my ($p, $pid, $ln, $init_pwd) = @_;
+    my $proc = proc_tree_get_proc($p, $pid, $ln);
+    if (exists $proc->{'parent'} && defined $proc->{'parent'}) {
+        if (exists $proc->{'parent'}{'pwd'}) {
+            $proc->{'pwd'} = $proc->{'parent'}{'pwd'};
+        } else {
+            err("no pwd1...");
+        }
+    } else {
+        err("no pwd2...");
+    }
+
+    return $proc->{'pwd'};
+}
+
+# set first process (tree root) pwd
+sub proc_tree_set_root_pwd {
+    my ($p, $pwd) = @_;
+    my @roots;
+    for my $pid (keys %$p) {
+        for (@{$p->{$pid}}) {
+            if (!exists $_->{'parent'} || !$_->{'parent'}) {
+                push @roots, [$pid, $_];
+            }
+        }
+    }
+    if (!@roots) {
+        err("no root found");
+    } elsif (@roots > 1) {
+        warning("found multiple roots");
+        for (@roots) {
+            printf STDERR "---\npid %d\n%s", $_->[0], Dumper($_->[1]);
+        }
+    }
+
+    for (@roots) {
+        $_->[1]->{'pwd'} = $pwd;
+    }
+}
+
+# set $pid,$ln to $pwd
+sub proc_tree_set_pwd {
+    my ($p, $pid, $ln, $pwd) = @_;
+    proc_tree_get_proc($p, $pid, $ln)->{'pwd'} = $pwd;
+}
+
+# return $pid,$ln current pwd
+sub proc_tree_get_pwd {
+    my ($p, $pid, $ln) = @_;
+    my $proc = proc_tree_get_proc($p, $pid, $ln);
+
+    # sometime child process calls execve() *before* the parent
+    # clone() call is finished, in that case we didn't inherit the pwd
+    # yet. this was a pain to debug and resolve.
+
+    if (!exists $proc->{'pwd'} || !defined $proc->{'pwd'}) {
+        $proc->{'pwd'} = $proc->{'parent'}{'pwd'};
+    }
+
+    # if still a problem.. i dunno :(
+    if (!$proc->{'pwd'}) {
+        warning("no pwd for $pid at $ln\n");
+        err(Dumper $proc);
+    }
+
+    return $proc->{'pwd'};
+}
+
+# called for every process execution & look for compiler calls
+# add compilation unit and flags to $files hash and return 1
+# otherwise return 0
+sub filter_compiler_call {
+    my ($files, $pwd, $prog, @args) = @_;
+    my %h;
+    my @res;
+    my $src;
+
+    if ($prog !~ $COMPILER) {
+        return 0;
+    }
+
+    if ($VERBOSE) {
+        print "-"x10, "\n", "RAWARG: <$prog>\n";
+    }
+
+    for (my $i = 0; $i < @args; $i++) {
+        $_ = $args[$i];
+        if ($VERBOSE) {
+            print "RAWARG: <$_>\n";
+        }
+        # skip arg if we have already seen it
+        next if defined $h{$_};
+
+        # we need at least one source file otherwise it's most
+        # likely a linker call, so remember the source file
+        # when we see it
+        if (/^([^-].+\.(?:c|cpp|cc|cx|cxx))$/i) {
+            if ($src) {
+                msg("warning: multiple C files given on single compiler call (first was $src)\n");
+            }
+            $src = $1
+        }
+        elsif (/^-o$/) {
+            # skip next arg
+            $i++;
+            next;
+        }
+        # we want -std, ...
+        elsif (/^-std=/) {
+            push @res, $_;
+        }
+	elsif (/^-D(.*)$/) {
+	    my $val = $1;
+	    if (length($val) == 0) {
+		$val = $args[++$i];
+	    }
+	    push @res, "-D$val";
+	}
+        # we want -I includes taking into account current
+        # when the path is relative
+        elsif (/^-I(.*)$/) {
+	    my $dir = $1;
+	    if (length($dir) == 0) {
+		$dir = $args[++$i];
+	    }
+            push @res, "-I".prepend_if_relative($pwd, $dir);
+        }
+	# do the same but handle the fact they can be split in 2 args
+
+        elsif (m{^-i.+?/.+}) {
+            push @res, $_;
+        }
+
+        # non-options argument are most likely files
+        # but we skip binary output
+        # elsif (/^[^-]/ and !/\.(so|[aod])$/) {
+        #     push @res, $_;
+        # }
+
+        # skipping -pthread, -fxxxx type args, ...
+
+        # mark arg as seen
+        $h{$_} = 1;
+    }
+
+    # if no source file in the call don't use it
+    if (!$src) {
+        return 0;
+    }
+
+    my $path = prepend_if_relative($pwd, $src);
+
+    if (!-e $path) {
+        warning("skipping $path: cannot find file. directory tracking error or temporary build file\n");
+        return 0;
+    }
+
+    $$files{$path} = [@res];
+    return 1;
+}
+
+sub process_trace {
+    my ($trace) = @_;
+
+    my $files = {};
+    my $proc = {};
+    my $clone = qr/(?:vfork|fork|clone)/;
+
+    open my $f, '<', $trace or err("can't open file $trace\n");
+
+    # first pass to build the process hierarchy
+    my $ln = 0;
+    while (<$f>) {
+        $ln++;
+        if (/^(\d+) /) {
+            proc_tree_start($proc, $1, $ln);
+        }
+
+        if (!/execve/ && /$clone/ && /^(\d+).+= (\d+)/o) {
+            my ($parent, $child) = ($1, $2);
+            proc_tree_set_parent($proc, $child, $parent, $ln);
+        }
+        elsif (/^(\d+)\s+\+\+\+ exited with/) {
+            proc_tree_end($proc, $1, $ln);
+        }
+    }
+    seek $f, 0, 0;
+
+    my $init_pwd = abs_path(getcwd());
+    proc_tree_set_root_pwd($proc, $init_pwd);
+    # second pass to track working directory & look for the
+    # compilation flags
+    $ln = 0;
+    while (<$f>) {
+        $ln++;
+        chomp;
+        next if !/^(\d+) /;
+        my $pid = $1;
+
+        if (!/execve/ && /$clone/) {
+            if (/^\d+.+= (\d+)/) {
+                my ($parent, $child) = ($pid, $1);
+                proc_tree_inherit_pwd($proc, $child, $ln, $init_pwd);
+            } elsif (/unfinished/) {
+                proc_tree_propagate_parent_pwd($proc, $pid, $ln);
+            }
+        }
+        elsif (/chdir/ && (/\d<(.+)>/ || /"(.+)"/)) {
+            proc_tree_set_pwd($proc, $pid, $ln, unescape($1));
+        }
+        elsif (/^\d+\s+execve\("$quoted_string_rx", \[((?:"$quoted_string_rx"(?:, )?)+)\],/) {
+            my ($prog, @args) = extract($1);
+            filter_compiler_call($files, proc_tree_get_pwd($proc, $pid, $ln), $prog, @args);
+        }
+    }
+
+    return $files;
+}
+
+sub view_log {
+    my ($minlevel, $disabled) = @_;
+    my @res = ();
+
+    while (<>) {
+        chomp;
+        if (!/<#~>/) {
+            err("invalid log file $ARGV\n");
+        }
+        my @fs = split /<#~>/, $_, -1;
+
+        # DEBUG
+        if (@fs != 13) {
+            print "WTF ".(scalar @fs)."  $_\n";
+            my $i = 0;
+            for (@fs) {
+                printf "%2d: <%s>\n", $i++, $_;
+            }
+            print "\n\n";
+        }
+
+        my ($file, $line, $level, $msg, $diag, $ctx) = ($fs[3],$fs[2],int($fs[8]),$fs[6],$fs[5],$fs[9].$fs[10].$fs[11]);
+
+        next if $level > $minlevel;
+        next if $diag and defined $$disabled{$diag};
+
+        # samba skip
+        # if ($diag and $diag eq 'V501' && $ctx =~ m/DLIST_/m) {
+        #     next;
+        # }
+
+        push @res, [$file, $line, $msg, $level, $diag, $ctx];
+    }
+
+    # sort by directories/files/line number
+    @res = sort { ($$a[0] cmp $$b[0]) or ($$a[1] <=> $$b[1]) } @res;
+
+    my $lastdir = '';
+
+    for (@res) {
+        my ($path, $line, $msg, $level, $diag, $ctx) = @$_;
+        my ($dir, $fn) = splitpath($path);
+
+        if ($dir ne $lastdir) {
+            print "Entering directory '$dir'\n";
+            $lastdir = $dir;
+        }
+
+        printf "%-20s  %s %s\n", "$fn:$line:", $diag, $msg;
+    }
+}
+
+# fixed C escapes (no \000 or \x00)
+my %esc = (
+    'a' => chr(0x07),
+    'b' => chr(0x08),
+    'f' => chr(0x0C),
+    'n' => chr(0x0A),
+    'r' => chr(0x0D),
+    't' => chr(0x09),
+    'v' => chr(0x0B),
+    '\\' => '\\',
+    "'" => "'",
+    '"' => '"',
+    '?' => '?',
+    );
+
+sub unescape {
+    my $s = shift;
+    $s =~ s/\\([abfnrtv\\'"?]|[0-7]{1,3}|x[0-9A-Fa-f]{1,2})/
+            if    (defined $esc{$1})      { $esc{$1} }
+            elsif (substr($1,0,1) eq 'x') { chr(hex(substr($1,1))) }
+            else                          { chr(oct($1)) }
+           /oeg;
+    return $s;
+}
+
+# sub test_unescape {
+#     my @cases = (
+#         ['a\nb', "a\nb"],
+#         ['a\x0ab', "a\nb"],
+#         ['a\012b', "a\nb"],
+#         ['a\\\\b', "a\\b"],
+#     );
+
+#     for (@cases) {
+#         my ($in, $exp) = @$_;
+#         my $out = unescape($in);
+#         ($out eq $exp) or err(sprintf "fail unescape(%s) = <%s> (!= <%s>)\n", $in, $out, $exp);
+#     }
+#     print "ok\n";
+#     exit 0;
+# }
+# &test_unescape();
+
+
+# extract list of C quoted strings & return them unescaped
+sub extract {
+    my $s = shift;
+    my @r = ();
+    while ($s =~ m/"($quoted_string_rx)"/og) {
+        push @r, unescape($1);
+    }
+    return @r;
+}
+
+# extract PWD dir from the raw env string from strace
+sub find_pwd {
+    my $s = shift;
+    while ($s =~ m/"PWD=($quoted_string_rx)"/og) {
+        return unescape($1);
+    }
+    return '';
+}
+
+sub splitpath {
+    my $path = shift;
+    return '' if !defined $path;
+    if ($path =~ m{^(.*/)?([^/]+)$}) {
+        return (defined $1 ? $1 : '', $2);
+    } else {
+        return $path;
+    }
+}
+
+sub prepend_if_relative {
+    my ($prefix, $path) = @_;
+    if (substr($path, 0, 1) eq '/') {
+        return $path;
+    }
+    return "$prefix/$path";
+}
+
+sub read_conf {
+    my $fn = shift;
+    my %cfg;
+
+    open my $f, '<', $fn or err("can't read conf file $fn\n");
+    while (<$f>) {
+        chomp;
+        next if /^\s*#/;
+        if (m/^(.+?)=(.+)/) {
+            my ($var, $val) = ($1, $2);
+            $var =~ s/^\s+//g;
+            $var =~ s/\s+$//g;
+            $val =~ s/^\s+//g;
+            $val =~ s/\s+$//g;
+            if (exists $cfg{$var}) {
+                if (!ref $cfg{$var}) {
+                    $cfg{$var} = [$cfg{$var}];
+                }
+                push @{$cfg{$var}}, $val;
+            } else {
+                $cfg{$var} = $val;
+            }
+        }
+    }
+    return \%cfg;
+}
+
+sub warning {
+    print STDERR "pvs-tool: warning: ", @_;
+}
+sub msg {
+    print "pvs-tool: ", @_;
+}
+
+sub err {
+    print STDERR "pvs-tool: error: ", @_;
+    exit 1;
+}
+
+&main();
